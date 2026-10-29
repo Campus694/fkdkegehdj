@@ -13,7 +13,7 @@ workflows:
         script: |
           set -eu
           mkdir -p extracted
-          unzip -o "PaymentHelper-auto-login (4).zip" -d extracted
+          unzip -o "PaymentHelper-auto-login (5).zip" -d extracted
 
       - name: Install Gradle
         script: |
