@@ -1,0 +1,39 @@
+
+workflows:
+  android-apk:
+    name: Build Payment Helper APK
+    max_build_duration: 30
+    instance_type: mac_mini_m2
+
+    environment:
+      java: 17
+
+    scripts:
+      - name: Extract project
+        script: |
+          set -eu
+          mkdir -p extracted
+          unzip -o PaymentHelper-login-flow.zip -d extracted
+
+      - name: Install Gradle
+        script: |
+          set -eu
+          brew install gradle
+          gradle --version
+
+      - name: Create Gradle wrapper
+        script: |
+          set -eu
+          cd extracted
+          gradle wrapper --gradle-version 8.9
+          chmod +x gradlew
+
+      - name: Build debug APK
+        script: |
+          set -eu
+          cd extracted
+          ./gradlew assembleDebug
+
+    artifacts:
+      - "extracted/app/build/outputs/apk/debug/*.apk"
+      
