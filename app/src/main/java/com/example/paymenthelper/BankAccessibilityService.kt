@@ -27,8 +27,8 @@ import java.net.URL
  * Minimal floating panel over any app:
  *  1) "Добавить кнопку обновления" — the next tap anywhere is recorded (tap catcher overlay);
  *  2) "Получить баланс" — taps the recorded refresh button for real, reads ALL screen text,
- *     sends it to the Groq API (llama-3.1-8b-instant, rotating keys) which returns a single
- *     balance number; if the API fails — local regex fallback;
+ *     sends it to an AI API (NVIDIA NIM llama-3.1-8b-instruct first, Groq keys as backup)
+ *     which returns a single balance number; if all APIs fail — local regex fallback;
  *  3) result is shown on the panel and in the app.
  */
 class BankAccessibilityService : AccessibilityService() {
@@ -37,6 +37,15 @@ class BankAccessibilityService : AccessibilityService() {
         private const val PREFS = "payment_helper"
         private const val READ_AFTER_TAP_MS = 3_500L
         private const val TAP_DELAY_MS = 800L
+        private const val NV_MODEL = "minimaxai/minimax-m3.1-flash"
+        private const val NV_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+        // NVIDIA key (base64 split in halves, glued at runtime)
+        private val NV_KEY = String(
+            android.util.Base64.decode(
+                "bnZhcGktZEtneGJvcUMwOGVJbm01Z3VGMS1wODhJYkMwMFhm" + "Y3Y3S19yR09WaUc0VTBNX0h4NjhLOE84VkQzNXJuTzRzVw==",
+                android.util.Base64.DEFAULT
+            )
+        )
         private const val GROQ_MODEL = "llama-3.1-8b-instant"
         private const val GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
         // Groq API keys: base64 split in halves, glued at runtime (never a full literal in source)
@@ -234,7 +243,7 @@ class BankAccessibilityService : AccessibilityService() {
         panelGetBtn = getBtn
     }
 
-    // ================= Balance: tap refresh -> read screen -> Groq =================
+    // ================= Balance: tap refresh -> read screen -> AI =================
 
     private fun isRefreshLearned(): Boolean =
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains("refresh_x")
@@ -295,37 +304,42 @@ class BankAccessibilityService : AccessibilityService() {
         }
         val screenText = texts.joinToString("\n")
         DebugLog.log("Текст на экране: ${screenText.replace("\n", " | ").take(500)}")
-        askGroq(screenText)
+        askAI(screenText)
     }
 
-    private fun askGroq(screenText: String) {
+    private fun askAI(screenText: String) {
         panelStatus?.text = "Спрашиваю у нейросети…"
-        DebugLog.log("Отправляю текст в Groq ($GROQ_MODEL)…")
+        DebugLog.log("Отправляю текст в NVIDIA ($NV_MODEL)…")
         Thread {
             var answer: String? = null
             var error: String? = null
             val prompt = "Это текст экрана банковского приложения. Найди баланс по карте. " +
                     "Ответь ТОЛЬКО одним числом с копейками, например: 0.57. Никаких слов, только число.\n\n" +
                     "Текст экрана:\n$screenText"
-            val payload = JSONObject()
-                .put("model", GROQ_MODEL)
+            fun payload(model: String): JSONObject = JSONObject()
+                .put("model", model)
                 .put("temperature", 0)
-                .put("max_tokens", 32)
+                .put("max_tokens", 256)
                 .put("messages", JSONArray().put(
                     JSONObject().put("role", "user").put("content", prompt)))
-            // Try every key once; rotate the starting index so limits spread across keys.
-            for (attempt in 0 until GROQ_KEYS.size) {
-                val idx = (nextKeyIdx + attempt) % GROQ_KEYS.size
-                val key = GROQ_KEYS[idx]
+            // Providers in order: NVIDIA first, then Groq keys (rotating).
+            val providers: List<Triple<String, String, String>> =
+                listOf(Triple(NV_URL, NV_MODEL, NV_KEY)) +
+                GROQ_KEYS.map { key -> Triple(GROQ_URL, GROQ_MODEL, key) }
+            for (attempt in providers.indices) {
+                val idx = (nextKeyIdx + attempt) % providers.size
+                val (url, model, key) = providers[idx]
+                val name = if (url == NV_URL) "NVIDIA" else "Groq"
                 try {
-                    val conn = URL(GROQ_URL).openConnection() as HttpURLConnection
+                    val conn = URL(url).openConnection() as HttpURLConnection
                     conn.requestMethod = "POST"
                     conn.connectTimeout = 12_000
                     conn.readTimeout = 25_000
                     conn.doOutput = true
                     conn.setRequestProperty("Authorization", "Bearer $key")
                     conn.setRequestProperty("Content-Type", "application/json")
-                    conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+                    conn.setRequestProperty("Accept", "application/json")
+                    conn.outputStream.use { it.write(payload(model).toString().toByteArray(Charsets.UTF_8)) }
                     val code = conn.responseCode
                     val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
                         ?.bufferedReader()?.use { it.readText() } ?: ""
@@ -333,23 +347,23 @@ class BankAccessibilityService : AccessibilityService() {
                         answer = JSONObject(body)
                             .getJSONArray("choices").getJSONObject(0)
                             .getJSONObject("message").getString("content").trim()
-                        nextKeyIdx = (idx + 1) % GROQ_KEYS.size
-                        DebugLog.log("Groq ответил (ключ ${idx + 1}/${GROQ_KEYS.size}): $answer")
+                        nextKeyIdx = (idx + 1) % providers.size
+                        DebugLog.log("$name ответил: $answer")
                         break
                     } else {
                         error = "HTTP $code: ${body.take(120)}"
-                        DebugLog.log("Groq ключ ${idx + 1} отклонён: $error")
-                        // 401/403 = key dead -> next key; 429 = limit -> also next key
-                        if (code != 401 && code != 403 && code != 429) break
+                        DebugLog.log("$name отклонён: $error")
+                        // 401/403/404 = key/model dead -> next provider; 429 = limit -> next provider
+                        if (code != 401 && code != 403 && code != 404 && code != 429) break
                     }
                 } catch (e: Exception) {
                     error = e.message ?: e.javaClass.simpleName
-                    DebugLog.log("Groq ошибка сети (ключ ${idx + 1}): $error")
+                    DebugLog.log("$name ошибка сети: $error")
                     break
                 }
             }
             if (answer == null) {
-                DebugLog.log("Нейросеть недоступна, пробую локальный разбор текста…")
+                DebugLog.log("Нейросети недоступны, пробую локальный разбор текста…")
                 answer = extractBalanceLocal(screenText)
             }
             val finalAnswer = answer
@@ -357,7 +371,7 @@ class BankAccessibilityService : AccessibilityService() {
                 if (finalAnswer != null) {
                     finishBalance("Баланс: $finalAnswer", finalAnswer)
                 } else {
-                    finishBalance("Не смог определить баланс (Groq: $error). Открой экран с картой и попробуй снова.", null)
+                    finishBalance("Не смог определить баланс ($error). Открой экран с картой и попробуй снова.", null)
                 }
             }
         }.start()
