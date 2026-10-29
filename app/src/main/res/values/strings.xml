@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Payment Helper</string>
+    <string name="accessibility_description">Automates a single login attempt in the selected app: fills the stored password and taps the submit button, then reports the result. Nothing is read or clicked outside an active attempt.</string>
+</resources>
