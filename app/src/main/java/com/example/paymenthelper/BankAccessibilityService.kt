@@ -165,11 +165,14 @@ class BankAccessibilityService : AccessibilityService() {
     private val labelAmountRegex = Regex(
         "(?i)(?:баланс|доступно|остаток)\\D{0,20}?(${amountRegex.pattern})\\s*($currencyRegex.pattern)"
     )
+    private val labelPlainRegex = Regex(
+        "(?i)(?:баланс|доступно|остаток)\\D{0,30}?(\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2})"
+    )
     private val currencyAmountRegex = Regex(
         "(?i)($currencyRegex.pattern)\\s*(${amountRegex.pattern})"
     )
     private val plainAmountRegex = Regex(
-        "\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2}"
+        "(?<![\\d.,])(\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2})(?![\\d.,])"
     )
 
     // --- Tap capture + panel ---
@@ -560,13 +563,26 @@ class BankAccessibilityService : AccessibilityService() {
         amountWithCurrencyRegex.find(joined)?.let {
             return clean(it.groupValues[1] + " " + it.groupValues[2])
         }
+        // “Баланс: 0.57” even without currency
+        labelPlainRegex.find(joined)?.let {
+            return clean(it.groupValues[1])
+        }
         // currency written BEFORE the amount: “BYN 0.57”
         currencyAmountRegex.find(joined)?.let {
             return clean(it.groupValues[1] + " " + it.groupValues[2])
         }
-        // last resort: any decimal number like “1 234,56” or “0.57”
-        plainAmountRegex.find(joined)?.let {
-            return clean(it.value)
+        // last resort: any decimal amount like “1 234,56” or “0.57”,
+        // skipping values that look like dates (“29.10”, “03.2029”)
+        for (m in plainAmountRegex.findAll(joined)) {
+            val v = m.value
+            val sep = if (v.contains(',')) ',' else '.'
+            val parts = v.split(sep)
+            if (sep == '.' && parts.size == 2) {
+                val a = parts[0].toIntOrNull()
+                val b = parts[1].toIntOrNull()
+                if (a != null && b != null && a in 1..31 && b in 1..12) continue // похоже на дату — пропускаю
+            }
+            return clean(v)
         }
         return null
     }
