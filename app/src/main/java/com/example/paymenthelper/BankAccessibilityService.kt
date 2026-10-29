@@ -165,6 +165,9 @@ class BankAccessibilityService : AccessibilityService() {
     private val labelAmountRegex = Regex(
         "(?i)(?:баланс|доступно|остаток)\\D{0,20}?(${amountRegex.pattern})\\s*($currencyRegex.pattern)"
     )
+    private val cardBalanceRegex = Regex(
+        "(?i)баланс\\s+по\\s+карте\\D{0,40}?(\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2})"
+    )
     private val labelPlainRegex = Regex(
         "(?i)(?:баланс|доступно|остаток)\\D{0,30}?(\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2})"
     )
@@ -522,9 +525,10 @@ class BankAccessibilityService : AccessibilityService() {
                 finishBalance("Баланс получен: $value", value)
                 return
             }
-            DebugLog.log("В тексте экрана сумму не нашёл, пробую скриншот…")
+            finishBalance("Не нашёл строку «баланс по карте» на экране. Открой главный экран с картой.", null)
+            return
         }
-        takeScreenshotAndRead()
+        finishBalance("Экран пустой — не удалось прочитать.", null)
     }
 
     /** Tries to tap a “show balance” (eye) toggle if the app hides the amount. */
@@ -552,6 +556,10 @@ class BankAccessibilityService : AccessibilityService() {
 
     private fun extractBalance(texts: List<String>): String? {
         val joined = texts.joinToString(" | ")
+        // main target: “баланс по карте … 0.57 …”
+        cardBalanceRegex.find(joined)?.let {
+            return clean(it.groupValues[1])
+        }
         labelAmountRegex.find(joined)?.let {
             return clean(it.groupValues[1] + " " + it.groupValues[2])
         }
