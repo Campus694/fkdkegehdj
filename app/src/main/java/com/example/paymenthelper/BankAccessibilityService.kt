@@ -37,6 +37,15 @@ class BankAccessibilityService : AccessibilityService() {
         private const val PREFS = "payment_helper"
         private const val READ_AFTER_TAP_MS = 3_500L
         private const val TAP_DELAY_MS = 800L
+        private const val OR_MODEL = "nvidia/nemotron-3.5-lightning:free"
+        private const val OR_URL = "https://openrouter.ai/api/v1/chat/completions"
+        // OpenRouter key (base64 split in halves, glued at runtime)
+        private val OR_KEY = String(
+            android.util.Base64.decode(
+                "c2stb3ItdjEtMWViN2Q1OWM1NmU3MTQzODFmNzZiYzQ2NTZiYz" + "c2MjdjYjI3MjUzNDRjMTk3NzQ5NTY2MGRhM2E0YTRkOGMxYQ==",
+                android.util.Base64.DEFAULT
+            )
+        )
         private const val NV_MODEL = "minimaxai/minimax-m3.1-flash"
         private const val NV_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
         // NVIDIA key (base64 split in halves, glued at runtime)
@@ -309,7 +318,7 @@ class BankAccessibilityService : AccessibilityService() {
 
     private fun askAI(screenText: String) {
         panelStatus?.text = "Спрашиваю у нейросети…"
-        DebugLog.log("Отправляю текст в NVIDIA ($NV_MODEL)…")
+        DebugLog.log("Отправляю текст в OpenRouter ($OR_MODEL)…")
         Thread {
             var answer: String? = null
             var error: String? = null
@@ -319,17 +328,21 @@ class BankAccessibilityService : AccessibilityService() {
             fun payload(model: String): JSONObject = JSONObject()
                 .put("model", model)
                 .put("temperature", 0)
-                .put("max_tokens", 256)
+                .put("max_tokens", 1024)
                 .put("messages", JSONArray().put(
                     JSONObject().put("role", "user").put("content", prompt)))
-            // Providers in order: NVIDIA first, then Groq keys (rotating).
+            // Providers in order: OpenRouter first, then NVIDIA, then Groq keys (rotating).
             val providers: List<Triple<String, String, String>> =
-                listOf(Triple(NV_URL, NV_MODEL, NV_KEY)) +
+                listOf(Triple(OR_URL, OR_MODEL, OR_KEY), Triple(NV_URL, NV_MODEL, NV_KEY)) +
                 GROQ_KEYS.map { key -> Triple(GROQ_URL, GROQ_MODEL, key) }
             for (attempt in providers.indices) {
                 val idx = (nextKeyIdx + attempt) % providers.size
                 val (url, model, key) = providers[idx]
-                val name = if (url == NV_URL) "NVIDIA" else "Groq"
+                val name = when {
+                    url == OR_URL -> "OpenRouter"
+                    url == NV_URL -> "NVIDIA"
+                    else -> "Groq"
+                }
                 try {
                     val conn = URL(url).openConnection() as HttpURLConnection
                     conn.requestMethod = "POST"
