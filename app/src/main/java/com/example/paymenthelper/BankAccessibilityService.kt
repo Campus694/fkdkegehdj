@@ -2,7 +2,6 @@ package com.example.paymenthelper
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
-import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -10,7 +9,6 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
-import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -20,198 +18,65 @@ import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import org.json.JSONArray
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 
 /**
- * 1) PIN login (learn + replay) — unchanged.
- * 2) Small floating panel with ONE action: memorize the refresh button tap.
- * 3) "Показать баланс" in the app: open bank -> tap refresh -> read balance
- *    (a11y text first, then screenshot + ML Kit OCR; Android 11+).
+ * Minimal floating panel over any app:
+ *  1) "Добавить кнопку обновления" — the next tap anywhere is recorded (tap catcher overlay);
+ *  2) "Получить баланс" — taps the recorded refresh button for real, reads ALL screen text,
+ *     sends it to the Mistral API which returns a single balance number;
+ *  3) result is shown on the panel and in the app.
  */
 class BankAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val PREFS = "payment_helper"
-        private const val LOGIN_WINDOW_MS = 150_000L
-        private const val TAP_INTERVAL_MS = 450L
-        private const val PIN_LENGTH = 5
-        private const val SETTLE_AFTER_LAST_TAP_MS = 1_000L
-        private const val BALANCE_SETTLE_BEFORE_TAP_MS = 3_000L
-        private const val BALANCE_READ_AFTER_TAP_MS = 3_500L
-        private const val BALANCE_TIMEOUT_MS = 45_000L
+        private const val READ_AFTER_TAP_MS = 3_500L
+        private const val TAP_DELAY_MS = 800L
+        private const val MISTRAL_KEY = "mstrl_JygTEGiEiL26LVTw3MJEm9Te7DwLPIox_0Buh0j"
+        private const val MISTRAL_MODEL = "mistral-small-latest"
+        private const val MISTRAL_URL = "https://api.mistral.ai/v1/chat/completions"
 
         @Volatile var instance: BankAccessibilityService? = null
             private set
-
-        // --- PIN login state ---
-        @Volatile private var loginStartedAt: Long = 0L
-        @Volatile private var loginPackage: String? = null
-        @Volatile private var awaitingResult: Boolean = false
-        @Volatile private var replayInFlight: Boolean = false
-        private var learnMode: Boolean = true
-        private var manualHintShown = false
-        private var savedSteps: List<Pair<Float, Float>> = emptyList()
-
-        // --- Balance state ---
-        @Volatile private var balanceStartedAt: Long = 0L
-        @Volatile private var balancePackage: String? = null
-        @Volatile private var balanceTapped = false
-
-        fun beginLoginCheck(context: Context, packageName: String) {
-            loginStartedAt = SystemClock.elapsedRealtime()
-            loginPackage = packageName
-            awaitingResult = false
-            replayInFlight = false
-            manualHintShown = false
-            val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString("login_package", packageName)
-                .putLong("login_started_at", System.currentTimeMillis())
-                .putLong("login_result_time", 0L)
-            savedSteps = loadSteps(context)
-            learnMode = savedSteps.isEmpty()
-            prefs.apply()
-            DebugLog.log(
-                if (learnMode) "Первый запуск: введите пин-код вручную — запомню каждое нажатие."
-                else "Ввожу пин-код автоматически (${savedSteps.size} нажатий)."
-            )
-        }
-
-        private fun loadSteps(context: Context): List<Pair<Float, Float>> {
-            val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                .getString("pin_steps", null) ?: return emptyList()
-            return raw.split(";").mapNotNull { pair ->
-                val parts = pair.split(",")
-                if (parts.size == 2) {
-                    val x = parts[0].toFloatOrNull()
-                    val y = parts[1].toFloatOrNull()
-                    if (x != null && y != null) x to y else null
-                } else null
-            }
-        }
-
-        fun clearLearned(context: Context) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .remove("pin_steps").apply()
-            savedSteps = emptyList()
-            learnMode = true
-            DebugLog.log("Запомненный пин-код сброшен. Следующий вход — обучение.")
-        }
-
-        fun isRefreshLearned(context: Context): Boolean =
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains("refresh_x")
-
-        fun clearRefresh(context: Context) {
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .remove("refresh_x").remove("refresh_y").apply()
-            DebugLog.log("Кнопка обновления сброшена.")
-        }
-
-        /** Arms a full-screen catcher: the next tap anywhere is recorded. */
-        fun beginRefreshLearning() {
-            DebugLog.log("Тапни по кнопке обновления — запомню это место.")
-            instance?.armCapture()
-        }
-
-        /** Starts a balance check: the bank is brought to front by the caller. */
-        fun beginBalanceCheck(context: Context, packageName: String) {
-            if (!isRefreshLearned(context)) {
-                DebugLog.log("Сначала добавьте кнопку обновления через панель.")
-                return
-            }
-            balanceStartedAt = SystemClock.elapsedRealtime()
-            balancePackage = packageName
-            balanceTapped = false
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putLong("balance_result_time", 0L)
-                .apply()
-            DebugLog.log("Открываю банк и нажимаю обновление…")
-        }
-
-        private fun publishBalance(context: Context, message: String, balance: String?) {
-            balanceStartedAt = 0L
-            balanceTapped = false
-            balancePackage = null
-            DebugLog.log(message)
-            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                .putString("balance_result", message)
-                .putString("last_balance", balance)
-                .putLong("balance_result_time", System.currentTimeMillis())
-                .apply()
-        }
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private val tick = object : Runnable {
-        override fun run() {
-            try { onTick() } catch (e: Exception) {
-                DebugLog.log("Ошибка сервиса: ${e.message}")
-            } finally {
-                handler.postDelayed(this, 1_000L)
-            }
-        }
-    }
 
-    private val digitRegex = Regex("^\\d$")
-    private val loginScreenRegex = Regex("(?i)пин|введите|ключ|войти|passcode|password")
-    private val errorRegex = Regex(
-        "(?i)неверн|неправильн|ошибк|не удалось войти|повторите попытку|заблокирован|incorrect|wrong|invalid|try again"
-    )
-    private val homeWords = listOf(
-        "карты", "переводы", "платежи", "история", "баланс", "главная",
-        "последние", "favorites", "payments", "history", "main"
-    )
-    private val amountRegex = Regex("\\d+(?:[\\d\\s\\u00A0'.,]*\\d)?")
-    private val currencyRegex = Regex("(?i)BYN|руб\\.?|₽|RUB|USD|EUR|€|\\$")
-    private val amountWithCurrencyRegex = Regex("(${amountRegex.pattern})\\s*($currencyRegex.pattern)")
-    private val labelAmountRegex = Regex(
-        "(?i)(?:баланс|доступно|остаток)\\D{0,20}?(${amountRegex.pattern})\\s*($currencyRegex.pattern)"
-    )
-    private val cardBalanceRegex = Regex(
-        "(?i)баланс\\s+по\\s+карте\\D{0,40}?(\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2})"
-    )
-    private val labelPlainRegex = Regex(
-        "(?i)(?:баланс|доступно|остаток)\\D{0,30}?(\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2})"
-    )
-    private val currencyAmountRegex = Regex(
-        "(?i)($currencyRegex.pattern)\\s*(${amountRegex.pattern})"
-    )
-    private val plainAmountRegex = Regex(
-        "(?<![\\d.,])(\\d{1,3}(?:[\\s\\u00A0']\\d{3})+[.,]\\d{2}|\\d+[.,]\\d{2})(?![\\d.,])"
-    )
-
-    // --- Tap capture + panel ---
-    private var captureView: android.view.View? = null
-    private var panelView: android.view.View? = null
+    // --- Panel + tap capture ---
+    private var panelView: View? = null
+    private var captureView: View? = null
     private var panelStatus: TextView? = null
     private var panelAddBtn: Button? = null
     private var panelGetBtn: Button? = null
-    @Volatile private var balanceForPanel = false
-    @Volatile private var panelBalanceInFlight = false
+    @Volatile private var balanceInFlight = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-        handler.removeCallbacks(tick)
-        handler.post(tick)
     }
 
     override fun onDestroy() {
         if (instance === this) instance = null
         removeCapture()
         hidePanel()
-        handler.removeCallbacks(tick)
         super.onDestroy()
     }
 
     override fun onInterrupt() = Unit
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
 
-    // ================= Tap capture (any tap on screen) =================
+    // ================= Tap catcher (any tap on screen) =================
 
     fun armCapture() {
         if (captureView != null) return
         handler.post {
             try {
                 val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-                val catcher = android.view.View(this)
+                val catcher = View(this)
                 catcher.background = android.graphics.drawable.ColorDrawable(Color.argb(40, 255, 255, 0))
                 catcher.isClickable = true
                 catcher.setOnTouchListener { _, ev ->
@@ -226,7 +91,7 @@ class BankAccessibilityService : AccessibilityService() {
                         DebugLog.log("Кнопка обновления запомнена: (${x.toInt()}, ${y.toInt()})")
                         panelStatus?.text = "Готово! Кнопка обновления запомнена."
                         panelAddBtn?.text = "Добавить заново"
-                        panelGetBtn?.visibility = android.view.View.VISIBLE
+                        panelGetBtn?.visibility = View.VISIBLE
                         true
                     } else false
                 }
@@ -253,7 +118,7 @@ class BankAccessibilityService : AccessibilityService() {
         captureView = null
     }
 
-    // ================= Small floating panel =================
+    // ================= Floating panel =================
 
     fun showPanel() {
         if (panelView != null) return
@@ -290,7 +155,7 @@ class BankAccessibilityService : AccessibilityService() {
         val status = TextView(this)
         status.setTextColor(Color.rgb(150, 220, 150))
         status.textSize = 12f
-        status.text = if (isRefreshLearned(applicationContext)) "Кнопка обновления задана."
+        status.text = if (isRefreshLearned()) "Кнопка обновления задана."
             else "Добавь кнопку обновления баланса."
         box.addView(status)
         panelStatus = status
@@ -311,7 +176,7 @@ class BankAccessibilityService : AccessibilityService() {
         getBtn.textSize = 12f
         getBtn.setAllCaps(false)
         getBtn.setOnClickListener { panelBalanceRun() }
-        getBtn.visibility = if (isRefreshLearned(applicationContext)) android.view.View.VISIBLE else android.view.View.GONE
+        getBtn.visibility = if (isRefreshLearned()) View.VISIBLE else View.GONE
         box.addView(getBtn)
         panelGetBtn = getBtn
 
@@ -360,349 +225,125 @@ class BankAccessibilityService : AccessibilityService() {
         panelGetBtn = getBtn
     }
 
-    /** «Получить баланс» прямо с панели: тап по обновлению + чтение, результат на панели. */
+    // ================= Balance: tap refresh -> read screen -> Mistral =================
+
+    private fun isRefreshLearned(): Boolean =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains("refresh_x")
+
     private fun panelBalanceRun() {
-        if (panelBalanceInFlight) return
-        if (!isRefreshLearned(this)) {
+        if (balanceInFlight) return
+        if (!isRefreshLearned()) {
             panelStatus?.text = "Сначала добавь кнопку обновления."
             return
         }
-        panelBalanceInFlight = true
+        balanceInFlight = true
         panelStatus?.text = "Нажимаю обновление…"
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val x = prefs.getFloat("refresh_x", 0f)
         val y = prefs.getFloat("refresh_y", 0f)
         handler.postDelayed({
-            DebugLog.log("Панель: нажимаю обновление баланса…")
-            tapAt(x, y) { }
-            panelStatus?.text = "Читаю баланс…"
-        }, 800L)
-        handler.postDelayed({
-            balanceForPanel = true
-            readBalance()
-        }, 800L + BALANCE_READ_AFTER_TAP_MS)
+            DebugLog.log("Нажимаю кнопку обновления…")
+            tapAt(x, y)
+            panelStatus?.text = "Жду данные и читаю экран…"
+        }, TAP_DELAY_MS)
+        handler.postDelayed({ readScreenAndAsk() }, TAP_DELAY_MS + READ_AFTER_TAP_MS)
     }
 
-    /** Publishes result: shows balance on the panel if started from it; screenshot path always returns to the app. */
-    private fun finishBalance(message: String, value: String?) {
-        publishBalance(applicationContext, message, value)
-        if (balanceForPanel && value != null) {
-            balanceForPanel = false
-            panelBalanceInFlight = false
-            panelStatus?.text = "Баланс: $value"
-        } else {
-            balanceForPanel = false
-            panelBalanceInFlight = false
-            returnToApp()
-        }
+    private fun tapAt(x: Float, y: Float) {
+        val path = android.graphics.Path().apply { moveTo(x, y) }
+        val gesture = android.accessibilityservice.GestureDescription.Builder()
+            .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, 60L))
+            .build()
+        dispatchGesture(gesture, null, null)
     }
 
-    // ================= Events =================
-
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-        if (event.eventType != AccessibilityEvent.TYPE_VIEW_CLICKED) return
-        // ignore clicks on our own panel/UI
-        if (event.packageName?.toString() == applicationContext.packageName) return
-        val node = event.source ?: return
-        val rect = android.graphics.Rect()
-        node.getBoundsInScreen(rect)
-        if (rect.isEmpty) return
-
-        // PIN learning taps (old flow)
-        val pkg = event.packageName?.toString() ?: return
-        if (loginStartedAt != 0L && learnMode && pkg == loginPackage) {
-            val label = node.text?.toString()?.trim().orEmpty()
-            if (digitRegex.matches(label)) {
-                val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                val current = prefs.getString("pin_draft", "") ?: ""
-                val updated = if (current.isEmpty()) "${rect.exactCenterX()},${rect.exactCenterY()}"
-                    else "$current;${rect.exactCenterX()},${rect.exactCenterY()}"
-                prefs.edit().putString("pin_draft", updated).apply()
-                val count = updated.split(";").size
-                DebugLog.log("Запомнено нажатие №$count.")
-                if (count >= PIN_LENGTH) {
-                    prefs.edit().putString("pin_steps", updated).remove("pin_draft").apply()
-                    savedSteps = loadSteps(this)
-                    learnMode = false
-                    publishResult("Пин-код запомнен ($count нажатий). Дальше справлюсь сам!")
-                }
-            }
-        }
-    }
-
-    // ================= Tick state machines =================
-
-    private fun onTick() {
-        // --- Balance check ---
-        if (balanceStartedAt != 0L) {
-            val now = SystemClock.elapsedRealtime()
-            if (now - balanceStartedAt > BALANCE_TIMEOUT_MS) {
-                publishBalance(this, "Не удалось получить баланс за отведённое время.", null)
-                returnToApp()
-                return
-            }
-            val root = rootInActiveWindow
-            if (root == null || root.packageName?.toString() != balancePackage) return
-
-            if (!balanceTapped) {
-                if (now - balanceStartedAt < BALANCE_SETTLE_BEFORE_TAP_MS) return
-                val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                tapAt(prefs.getFloat("refresh_x", 0f), prefs.getFloat("refresh_y", 0f)) { }
-                balanceTapped = true
-                DebugLog.log("Нажал обновление, жду свежие данные…")
-                handler.postDelayed({ readBalance() }, BALANCE_READ_AFTER_TAP_MS)
-            }
-            return
-        }
-
-        // --- PIN login ---
-        if (loginStartedAt == 0L) return
-        val bank = loginPackage ?: return
-        val now = SystemClock.elapsedRealtime()
-
-        if (now - loginStartedAt > LOGIN_WINDOW_MS) {
-            publishResult("Время вышло, вход не подтверждён. Попробуйте ещё раз.")
-            return
-        }
-
-        val root = rootInActiveWindow ?: return
-        if (root.packageName?.toString() != bank) return
-
-        val texts = mutableListOf<String>()
-        collectVisibleText(root, texts, 0)
-        val screenText = texts.joinToString(" ")
-
-        if (awaitingResult) {
-            when {
-                looksLikeLoggedInHome(screenText) -> publishResult("Красава, вход выполнен!")
-                errorRegex.containsMatchIn(screenText) ->
-                    publishResult("Вход не выполнен: банк сообщил об ошибке. Проверьте пин-код.")
-            }
-            return
-        }
-
-        if (learnMode) {
-            if (!manualHintShown) {
-                manualHintShown = true
-                DebugLog.log("Жду ваш пин-код: просто введите его на клавиатуре банка.")
-            }
-        } else if (!replayInFlight) {
-            replayPin()
-        }
-    }
-
-    // ================= Balance reading =================
-
-    /** Collects text from ALL windows (not only the active one). */
     private fun allScreenTexts(): List<String> {
         val out = mutableListOf<String>()
         try {
             val roots = mutableListOf(rootInActiveWindow)
             try { windows.forEach { roots.add(it.root) } } catch (_: Exception) {}
-            roots.filterNotNull().forEach { collectVisibleText(it, out, 0) }
+            roots.filterNotNull().forEach { collectText(it, out, 0) }
         } catch (e: Exception) {
             DebugLog.log("Ошибка чтения экрана: ${e.message}")
         }
         return out
     }
 
-    private fun readBalance() {
-        // The balance may be masked — try to tap the eye toggle first.
-        if (tapMaskToggle()) {
-            DebugLog.log("Нашёл кнопку показа баланса, нажимаю её…")
-            handler.postDelayed({ doRead() }, 1_200L)
-        } else {
-            doRead()
-        }
-    }
-
-    private fun doRead() {
-        val texts = allScreenTexts()
-        if (texts.isNotEmpty()) {
-            DebugLog.log("Текст на экране: ${texts.joinToString(" | ").take(500)}")
-            extractBalance(texts)?.let { value ->
-                finishBalance("Баланс получен: $value", value)
-                return
-            }
-            finishBalance("Не нашёл строку «баланс по карте» на экране. Открой главный экран с картой.", null)
-            return
-        }
-        finishBalance("Экран пустой — не удалось прочитать.", null)
-    }
-
-    /** Tries to tap a “show balance” (eye) toggle if the app hides the amount. */
-    private fun tapMaskToggle(): Boolean {
-        val root = rootInActiveWindow ?: return false
-        val re = Regex("(?i)показать баланс|показ|глаз|eye|скрыт")
-        var tapped = false
-        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
-            if (node == null || depth > 25 || tapped) return
-            val desc = (node.contentDescription?.toString() ?: "") + " " + (node.text?.toString() ?: "")
-            if (node.isClickable && re.containsMatchIn(desc) && desc.length < 60) {
-                val r = android.graphics.Rect()
-                node.getBoundsInScreen(r)
-                if (!r.isEmpty) {
-                    tapAt(r.exactCenterX(), r.exactCenterY()) { }
-                    tapped = true
-                    return
-                }
-            }
-            for (i in 0 until node.childCount) walk(node.getChild(i), depth + 1)
-        }
-        walk(root, 0)
-        return tapped
-    }
-
-    private fun extractBalance(texts: List<String>): String? {
-        val joined = texts.joinToString(" | ")
-        // main target: “баланс по карте … 0.57 …”
-        cardBalanceRegex.find(joined)?.let {
-            return clean(it.groupValues[1])
-        }
-        labelAmountRegex.find(joined)?.let {
-            return clean(it.groupValues[1] + " " + it.groupValues[2])
-        }
-        for (i in texts.indices) {
-            amountWithCurrencyRegex.find(texts[i])?.let {
-                return clean(it.groupValues[1] + " " + it.groupValues[2])
-            }
-        }
-        amountWithCurrencyRegex.find(joined)?.let {
-            return clean(it.groupValues[1] + " " + it.groupValues[2])
-        }
-        // “Баланс: 0.57” even without currency
-        labelPlainRegex.find(joined)?.let {
-            return clean(it.groupValues[1])
-        }
-        // currency written BEFORE the amount: “BYN 0.57”
-        currencyAmountRegex.find(joined)?.let {
-            return clean(it.groupValues[1] + " " + it.groupValues[2])
-        }
-        // last resort: any decimal amount like “1 234,56” or “0.57”,
-        // skipping values that look like dates (“29.10”, “03.2029”)
-        for (m in plainAmountRegex.findAll(joined)) {
-            val v = m.value
-            val sep = if (v.contains(',')) ',' else '.'
-            val parts = v.split(sep)
-            if (sep == '.' && parts.size == 2) {
-                val a = parts[0].toIntOrNull()
-                val b = parts[1].toIntOrNull()
-                if (a != null && b != null && a in 1..31 && b in 1..12) continue // похоже на дату — пропускаю
-            }
-            return clean(v)
-        }
-        return null
-    }
-
-    private fun takeScreenshotAndRead() {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
-            finishBalance("Баланс не найден: нужен Android 11+ для скриншота.", null)
-            return
-        }
-        takeScreenshot(android.view.Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
-            override fun onSuccess(screenshot: ScreenshotResult) {
-                try {
-                    val hardwareBuffer = screenshot.hardwareBuffer
-                    val bitmap = Bitmap.wrapHardwareBuffer(hardwareBuffer, screenshot.colorSpace)
-                    hardwareBuffer.close()
-                    if (bitmap == null) {
-                        finishBalance("Скриншот не удался.", null)
-                        return
-                    }
-                    val safe = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                    // Save the screenshot so the app can show it to the user.
-                    val file = java.io.File(applicationContext.filesDir, "balance_shot.png")
-                    file.outputStream().use { safe.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                    applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                        .putString("shot_path", file.absolutePath)
-                        .putLong("shot_time", System.currentTimeMillis())
-                        .apply()
-                    finishBalance("Скриншот готов, показываю в приложении.", null)
-                } catch (e: Exception) {
-                    finishBalance("Ошибка скриншота: ${e.message}", null)
-                }
-            }
-            override fun onFailure(errorCode: Int) {
-                finishBalance("Скриншот запрещён системой (код $errorCode).", null)
-            }
-        })
-    }
-
-    // ================= PIN login helpers =================
-
-    private fun returnToApp() {
-        val back = packageManager.getLaunchIntentForPackage(applicationContext.packageName)
-        if (back != null) {
-            back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            startActivity(back)
-        }
-    }
-
-    private fun replayPin() {
-        if (savedSteps.isEmpty()) return
-        replayInFlight = true
-        DebugLog.log("Начинаю ввод пин-кода через 7 секунд…")
-        val startDelayMs = 7_000L
-        savedSteps.forEachIndexed { index, (x, y) ->
-            handler.postDelayed({
-                DebugLog.log("Нажимаю цифру ${index + 1} из ${savedSteps.size}…")
-                tapAt(x, y) { }
-            }, startDelayMs + index * TAP_INTERVAL_MS)
-        }
-        handler.postDelayed({
-            awaitingResult = true
-            replayInFlight = false
-        }, startDelayMs + savedSteps.size * TAP_INTERVAL_MS + SETTLE_AFTER_LAST_TAP_MS)
-    }
-
-    private fun tapAt(x: Float, y: Float, callback: (Boolean) -> Unit) {
-        val path = android.graphics.Path().apply { moveTo(x, y) }
-        val gesture = android.accessibilityservice.GestureDescription.Builder()
-            .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(path, 0L, 60L))
-            .build()
-        val dispatched = dispatchGesture(gesture, object : GestureResultCallback() {
-            override fun onCompleted(g: android.accessibilityservice.GestureDescription?) = callback(true)
-            override fun onCancelled(g: android.accessibilityservice.GestureDescription?) {
-                DebugLog.log("Нажатие отменено системой.")
-                callback(false)
-            }
-        }, null)
-        if (!dispatched) callback(false)
-    }
-
-    private fun looksLikeLoggedInHome(allText: String): Boolean {
-        val all = allText.lowercase()
-        if (loginScreenRegex.containsMatchIn(all)) return false
-        return homeWords.count { it in all } >= 2
-    }
-
-    private fun publishResult(message: String) {
-        loginStartedAt = 0L
-        awaitingResult = false
-        loginPackage = null
-        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().remove("pin_draft").apply()
-        DebugLog.log(message)
-        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.edit()
-            .putString("login_result", message)
-            .putLong("login_result_time", System.currentTimeMillis())
-            .apply()
-        val back = prefs.getString("login_package", null)?.let { packageManager.getLaunchIntentForPackage(it) }
-        if (back != null) {
-            back.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            startActivity(back)
-        }
-    }
-
-    private fun collectVisibleText(node: AccessibilityNodeInfo?, out: MutableList<String>, depth: Int) {
+    private fun collectText(node: AccessibilityNodeInfo?, out: MutableList<String>, depth: Int) {
         if (node == null || depth > 25 || out.size > 500) return
         if (node.isVisibleToUser) {
             node.text?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(out::add)
             node.contentDescription?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let(out::add)
         }
-        for (i in 0 until node.childCount) collectVisibleText(node.getChild(i), out, depth + 1)
+        for (i in 0 until node.childCount) collectText(node.getChild(i), out, depth + 1)
     }
 
-    private fun clean(s: String): String = s.replace(Regex("[\\s\\u00A0]+"), " ").trim()
+    private fun readScreenAndAsk() {
+        val texts = allScreenTexts()
+        if (texts.isEmpty()) {
+            finishBalance("Экран пустой — не удалось прочитать.", null)
+            return
+        }
+        val screenText = texts.joinToString("\n")
+        DebugLog.log("Текст на экране: ${screenText.replace("\n", " | ").take(500)}")
+        askMistral(screenText)
+    }
+
+    private fun askMistral(screenText: String) {
+        panelStatus?.text = "Спрашиваю у нейросети…"
+        DebugLog.log("Отправляю текст в Mistral ($MISTRAL_MODEL)…")
+        Thread {
+            var answer: String? = null
+            var error: String? = null
+            try {
+                val conn = URL(MISTRAL_URL).openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 15_000
+                conn.readTimeout = 30_000
+                conn.doOutput = true
+                conn.setRequestProperty("Authorization", "Bearer $MISTRAL_KEY")
+                conn.setRequestProperty("Content-Type", "application/json")
+                val prompt = "Это текст экрана банковского приложения. Найди баланс по карте. " +
+                        "Ответь ТОЛЬКО одним числом с копейками, например: 0.57. Никаких слов, только число.\n\n" +
+                        "Текст экрана:\n$screenText"
+                val payload = JSONObject()
+                    .put("model", MISTRAL_MODEL)
+                    .put("temperature", 0)
+                    .put("messages", JSONArray().put(
+                        JSONObject().put("role", "user").put("content", prompt)))
+                conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                    ?.bufferedReader()?.use { it.readText() } ?: ""
+                if (code in 200..299) {
+                    answer = JSONObject(body)
+                        .getJSONArray("choices").getJSONObject(0)
+                        .getJSONObject("message").getString("content").trim()
+                } else {
+                    error = "HTTP $code: ${body.take(200)}"
+                }
+            } catch (e: Exception) {
+                error = e.message ?: e.javaClass.simpleName
+            }
+            handler.post {
+                if (answer != null) {
+                    DebugLog.log("Mistral ответил: $answer")
+                    finishBalance("Баланс: $answer", answer)
+                } else {
+                    finishBalance("Mistral не ответил: $error", null)
+                }
+            }
+        }.start()
+    }
+
+    private fun finishBalance(message: String, balance: String?) {
+        balanceInFlight = false
+        DebugLog.log(message)
+        panelStatus?.text = if (balance != null) "Баланс: $balance" else message
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("balance_result", message)
+            .putString("last_balance", balance)
+            .putLong("balance_result_time", System.currentTimeMillis())
+            .apply()
+    }
 }
