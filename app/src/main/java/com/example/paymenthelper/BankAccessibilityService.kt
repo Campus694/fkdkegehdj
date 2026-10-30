@@ -2,6 +2,7 @@ package com.example.paymenthelper
 
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
@@ -37,6 +38,11 @@ class BankAccessibilityService : AccessibilityService() {
         private const val PREFS = "payment_helper"
         private const val READ_AFTER_TAP_MS = 3_500L
         private const val TAP_DELAY_MS = 800L
+        private const val PIN_TAPS = 5
+        private const val BANK_OPEN_WAIT_MS = 7_000L
+        private const val PIN_SETTLE_MS = 5_000L
+        private const val PIN_TAP_GAP_MS = 500L
+        private const val BANK_PKG_DEFAULT = "com.mobicon.mbank2.belarusbank"
         private const val CF_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast"
         private val CF_URL =
             "https://api.cloudflare.com/client/v4/accounts/" + String(
@@ -80,6 +86,7 @@ class BankAccessibilityService : AccessibilityService() {
     private var panelAddBtn: Button? = null
     private var panelGetBtn: Button? = null
     @Volatile private var balanceInFlight = false
+    @Volatile private var autoCleanupNeeded = false
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -100,42 +107,106 @@ class BankAccessibilityService : AccessibilityService() {
 
     // ================= Tap catcher (any tap on screen) =================
 
+    private fun makeCatcherOverlay(): View? {
+        return try {
+            val wm = getSystemService(WINDOW_SERVICE) as WindowManager
+            val catcher = View(this)
+            catcher.background = android.graphics.drawable.ColorDrawable(Color.argb(40, 255, 255, 0))
+            catcher.isClickable = true
+            val p = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                PixelFormat.TRANSLUCENT
+            )
+            wm.addView(catcher, p)
+            captureView = catcher
+            catcher
+        } catch (e: Exception) {
+            DebugLog.log("Не удалось включить ловушку тапов: ${e.message}")
+            null
+        }
+    }
+
+    /** Remember which app the user is configuring (any window that is not ours). */
+    private fun currentBankPackage(): String? {
+        val counts = HashMap<String, Int>()
+        try {
+            val roots = mutableListOf(rootInActiveWindow)
+            try { windows.forEach { roots.add(it.root) } } catch (_: Exception) {}
+            roots.filterNotNull().forEach { r ->
+                r.packageName?.toString()?.takeIf { it != packageName }?.let {
+                    counts[it] = (counts[it] ?: 0) + 1
+                }
+            }
+        } catch (_: Exception) {}
+        return counts.maxByOrNull { it.value }?.key
+    }
+
+    private fun rememberBankPackage() {
+        currentBankPackage()?.let {
+            getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("bank_pkg", it).apply()
+            DebugLog.log("Приложение банка: $it")
+        }
+    }
+
+    /** Learn the refresh-button coordinates: the next single tap. */
     fun armCapture() {
         if (captureView != null) return
         handler.post {
-            try {
-                val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-                val catcher = View(this)
-                catcher.background = android.graphics.drawable.ColorDrawable(Color.argb(40, 255, 255, 0))
-                catcher.isClickable = true
-                catcher.setOnTouchListener { _, ev ->
-                    if (ev.action == MotionEvent.ACTION_DOWN) {
-                        val x = ev.rawX
-                        val y = ev.rawY
+            val catcher = makeCatcherOverlay() ?: return@post
+            catcher.setOnTouchListener { _, ev ->
+                if (ev.action == MotionEvent.ACTION_DOWN) {
+                    val x = ev.rawX
+                    val y = ev.rawY
+                    removeCapture()
+                    rememberBankPackage()
+                    getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                        .putFloat("refresh_x", x)
+                        .putFloat("refresh_y", y)
+                        .apply()
+                    DebugLog.log("Кнопка обновления запомнена: (${x.toInt()}, ${y.toInt()})")
+                    panelStatus?.text = "Готово! Кнопка обновления запомнена."
+                    panelAddBtn?.text = "Добавить заново"
+                    panelGetBtn?.visibility = View.VISIBLE
+                    true
+                } else false
+            }
+            panelStatus?.text = "Тапни по кнопке обновления (жёлтая подсветка = ловушка активна)."
+        }
+    }
+
+    /** Learn the PIN: the next 5 taps are recorded one by one. */
+    fun armPinCapture() {
+        if (captureView != null) return
+        handler.post {
+            val catcher = makeCatcherOverlay() ?: return@post
+            val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            var n = 0
+            panelStatus?.text = "Пин 1/5: тапни первую цифру…"
+            catcher.setOnTouchListener { _, ev ->
+                if (ev.action == MotionEvent.ACTION_DOWN) {
+                    val x = ev.rawX
+                    val y = ev.rawY
+                    n++
+                    prefs.edit()
+                        .putFloat("pin_x$n", x)
+                        .putFloat("pin_y$n", y)
+                        .putInt("pin_count", n)
+                        .apply()
+                    DebugLog.log("Пин $n/5 запомнен: (${x.toInt()}, ${y.toInt()})")
+                    if (n < 5) {
+                        panelStatus?.text = "Пин ${n + 1}/5: тапни следующую цифру…"
+                    } else {
                         removeCapture()
-                        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-                            .putFloat("refresh_x", x)
-                            .putFloat("refresh_y", y)
-                            .apply()
-                        DebugLog.log("Кнопка обновления запомнена: (${x.toInt()}, ${y.toInt()})")
-                        panelStatus?.text = "Готово! Кнопка обновления запомнена."
-                        panelAddBtn?.text = "Добавить заново"
+                        rememberBankPackage()
+                        DebugLog.log("Пин-код задан (5 тапов).")
+                        panelStatus?.text = "Пин-код задан! Теперь добавь кнопку обновления."
                         panelGetBtn?.visibility = View.VISIBLE
-                        true
-                    } else false
-                }
-                val p = WindowManager.LayoutParams(
-                    WindowManager.LayoutParams.MATCH_PARENT,
-                    WindowManager.LayoutParams.MATCH_PARENT,
-                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-                    PixelFormat.TRANSLUCENT
-                )
-                wm.addView(catcher, p)
-                captureView = catcher
-                panelStatus?.text = "Тапни по кнопке обновления (жёлтая подсветка = ловушка активна)."
-            } catch (e: Exception) {
-                DebugLog.log("Не удалось включить ловушку тапов: ${e.message}")
+                    }
+                    true
+                } else false
             }
         }
     }
@@ -184,10 +255,23 @@ class BankAccessibilityService : AccessibilityService() {
         val status = TextView(this)
         status.setTextColor(Color.rgb(150, 220, 150))
         status.textSize = 12f
-        status.text = if (isRefreshLearned()) "Кнопка обновления задана."
-            else "Добавь кнопку обновления баланса."
+        status.text = when {
+            !isPinLearned() -> "Добавь пин-код (5 тапов)."
+            !isRefreshLearned() -> "Пин задан. Добавь кнопку обновления."
+            else -> "Пин и кнопка обновления заданы."
+        }
         box.addView(status)
         panelStatus = status
+
+        val pinBtn = Button(this)
+        pinBtn.text = if (isPinLearned()) "Пин-код: задан (добавить заново)" else "Добавить пин-код"
+        pinBtn.textSize = 12f
+        pinBtn.setAllCaps(false)
+        pinBtn.setOnClickListener {
+            pinBtn.text = "Тапай цифры пина в банке (5 штук)…"
+            armPinCapture()
+        }
+        box.addView(pinBtn)
 
         val addBtn = Button(this)
         addBtn.text = "Добавить кнопку обновления"
@@ -372,95 +456,6 @@ class BankAccessibilityService : AccessibilityService() {
         }.start()
     }
 
-    // ================= Telegram remote control =================
-
-    private fun startTgPolling() {
-        if (tgPollThread != null && tgPollThread!!.isAlive) return
-        val t = Thread {
-            var offset = 0L
-            DebugLog.log("Telegram: слежу за командами (чат $TG_CHAT_ID)…")
-            tgSend("Payment Helper на связи. Отправь /balance — обновлю баланс.")
-            while (tgPollThread === Thread.currentThread()) {
-                try {
-                    val url = URL("https://api.telegram.org/bot$TG_TOKEN/getUpdates?timeout=25&offset=$offset")
-                    val conn = url.openConnection() as HttpURLConnection
-                    conn.connectTimeout = 10_000
-                    conn.readTimeout = 35_000
-                    val body = conn.inputStream.bufferedReader().use { it.readText() }
-                    val updates = JSONObject(body).optJSONArray("result") ?: JSONArray()
-                    for (i in 0 until updates.length()) {
-                        val u = updates.getJSONObject(i)
-                        offset = maxOf(offset, u.getLong("update_id") + 1)
-                        val msg = u.optJSONObject("message") ?: continue
-                        val chat = msg.optJSONObject("chat") ?: continue
-                        if (chat.optString("id") != TG_CHAT_ID) continue
-                        val text = msg.optString("text", "").trim().lowercase()
-                        if (text.startsWith("/balance") || text.contains("баланс") || text.contains("balance")) {
-                            handler.post { tgBalanceRun() }
-                        } else if (text.isNotEmpty()) {
-                            tgSend("Команды: /balance — получить баланс.")
-                        }
-                    }
-                } catch (e: Exception) {
-                    Thread.sleep(3_000)
-                }
-            }
-        }
-        t.isDaemon = true
-        tgPollThread = t
-        t.start()
-    }
-
-    private fun tgBalanceRun() {
-        if (balanceInFlight) {
-            tgSend("Запрос уже выполняется, подожди.")
-            return
-        }
-        if (!isRefreshLearned()) {
-            tgSend("Кнопка обновления не задана. Добавь её через панель в приложении.")
-            return
-        }
-        panelStatus?.text = "Команда из Telegram: обновляю баланс…"
-        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val x = prefs.getFloat("refresh_x", 0f)
-        val y = prefs.getFloat("refresh_y", 0f)
-        balanceInFlight = true
-        handler.postDelayed({
-            DebugLog.log("TG: нажимаю кнопку обновления…")
-            tapAt(x, y)
-        }, TAP_DELAY_MS)
-        handler.postDelayed({ readScreenAndAsk() }, TAP_DELAY_MS + READ_AFTER_TAP_MS)
-    }
-
-    private fun tgSend(text: String) {
-        // Always off the main thread (finishBalance runs on the UI handler).
-        Thread {
-            var attempt = 0
-            while (attempt < 3) {
-                try {
-                    val url = URL("https://api.telegram.org/bot$TG_TOKEN/sendMessage")
-                    val conn = url.openConnection() as HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.connectTimeout = 10_000
-                    conn.readTimeout = 20_000
-                    conn.doOutput = true
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    val payload = JSONObject()
-                        .put("chat_id", TG_CHAT_ID)
-                        .put("text", text)
-                    conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-                    val code = conn.responseCode
-                    if (code in 200..299) return@Thread
-                    DebugLog.log("TG send HTTP $code (попытка ${attempt + 1})")
-                } catch (e: Exception) {
-                    DebugLog.log("TG send error: ${e.javaClass.simpleName}: ${e.message}")
-                }
-                attempt++
-                try { Thread.sleep(1_500L * attempt) } catch (_: InterruptedException) { return@Thread }
-            }
-        }.start()
-    }
-
     /** Fallback: pull the balance straight from screen text without any API. */
     private fun extractBalanceLocal(text: String): String? {
         // Prefer "баланс ... <сумма>", then "доступно/остаток ... <сумма>"
@@ -506,5 +501,196 @@ class BankAccessibilityService : AccessibilityService() {
             .putString("last_balance", balance)
             .putLong("balance_result_time", System.currentTimeMillis())
             .apply()
+        if (autoCleanupNeeded) {
+            autoCleanupNeeded = false
+            handler.postDelayed({ closeBankAndRecents() }, 2_000L)
+        }
+    }
+
+    // ================= Telegram remote control =================
+
+    private fun startTgPolling() {
+        if (tgPollThread?.isAlive == true) return
+        val t = Thread {
+            var offset = 0L
+            DebugLog.log("Telegram: слежу за командами (чат $TG_CHAT_ID)…")
+            tgSend("Payment Helper на связи. Отправь /balance — обновлю и пришлю баланс.")
+            while (tgPollThread === Thread.currentThread()) {
+                try {
+                    val url = URL("https://api.telegram.org/bot$TG_TOKEN/getUpdates?timeout=25&offset=$offset")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 35_000
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val updates = JSONObject(body).optJSONArray("result") ?: JSONArray()
+                    for (i in 0 until updates.length()) {
+                        val u = updates.getJSONObject(i)
+                        offset = maxOf(offset, u.getLong("update_id") + 1)
+                        val msg = u.optJSONObject("message") ?: continue
+                        val chat = msg.optJSONObject("chat") ?: continue
+                        if (chat.optString("id") != TG_CHAT_ID) continue
+                        val text = msg.optString("text", "").trim().lowercase()
+                        if (text.startsWith("/balance") || text.contains("баланс") || text.contains("balance")) {
+                            handler.post { tgBalanceRun() }
+                        } else if (text.isNotEmpty()) {
+                            tgSend("Команды: /balance — получить баланс.")
+                        }
+                    }
+                } catch (e: Exception) {
+                    try { Thread.sleep(3_000) } catch (_: InterruptedException) { break }
+                }
+            }
+        }
+        t.isDaemon = true
+        tgPollThread = t
+        t.start()
+    }
+
+    private fun tgBalanceRun() {
+        if (balanceInFlight) {
+            tgSend("Запрос уже выполняется, подожди.")
+            return
+        }
+        if (!isRefreshLearned()) {
+            tgSend("Кнопка обновления не задана. Добавь её через панель в приложении.")
+            return
+        }
+        balanceInFlight = true
+        wakeScreen()
+        if (isPinLearned()) {
+            // Full autopilot: open bank -> PIN -> refresh -> read -> answer -> close.
+            autoCleanupNeeded = true
+            val pkg = getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("bank_pkg", null) ?: BANK_PKG_DEFAULT
+            val intent = packageManager.getLaunchIntentForPackage(pkg)
+            if (intent == null) {
+                DebugLog.log("Не нашёл приложение банка ($pkg), работаю по текущему экрану.")
+                autoCleanupNeeded = false
+                simpleRefreshAndRead()
+                return
+            }
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            DebugLog.log("TG: открываю банк ($pkg), жду ${BANK_OPEN_WAIT_MS / 1000}с…")
+            panelStatus?.text = "TG: открываю банк…"
+            startActivity(intent)
+            handler.postDelayed({
+                DebugLog.log("TG: ввожу пин-код…")
+                panelStatus?.text = "TG: ввожу пин-код…"
+                for (n in 1..PIN_TAPS) {
+                    handler.postDelayed({
+                        val p = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        tapAt(p.getFloat("pin_x$n", 0f), p.getFloat("pin_y$n", 0f))
+                    }, (n - 1) * PIN_TAP_GAP_MS)
+                }
+            }, BANK_OPEN_WAIT_MS)
+            val afterPin = BANK_OPEN_WAIT_MS + PIN_TAPS * PIN_TAP_GAP_MS + PIN_SETTLE_MS
+            handler.postDelayed({
+                DebugLog.log("TG: нажимаю кнопку обновления…")
+                panelStatus?.text = "TG: обновляю баланс…"
+                val p = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                tapAt(p.getFloat("refresh_x", 0f), p.getFloat("refresh_y", 0f))
+            }, afterPin)
+            handler.postDelayed({ readScreenAndAsk() }, afterPin + READ_AFTER_TAP_MS)
+        } else {
+            // No PIN learned: user is expected to be in the bank already.
+            autoCleanupNeeded = true
+            simpleRefreshAndRead()
+        }
+    }
+
+    /** Old short path: tap the refresh button on the current screen, then read. */
+    private fun simpleRefreshAndRead() {
+        panelStatus?.text = "Обновляю баланс…"
+        val p = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        handler.postDelayed({
+            DebugLog.log("Нажимаю кнопку обновления…")
+            tapAt(p.getFloat("refresh_x", 0f), p.getFloat("refresh_y", 0f))
+        }, TAP_DELAY_MS)
+        handler.postDelayed({ readScreenAndAsk() }, TAP_DELAY_MS + READ_AFTER_TAP_MS)
+    }
+
+    private fun isPinLearned(): Boolean =
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).getInt("pin_count", 0) >= PIN_TAPS
+
+    private fun wakeScreen() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            @Suppress("DEPRECATION")
+            val wl = pm.newWakeLock(
+                android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                        or android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                "PaymentHelper::balance"
+            )
+            wl.acquire(60_000L)
+        } catch (e: Exception) {
+            DebugLog.log("Не удалось разбудить экран: ${e.message}")
+        }
+    }
+
+    /** Home screen, then try to wipe the bank from the recents list. */
+    private fun closeBankAndRecents() {
+        DebugLog.log("Закрываю банк и чищу недавние…")
+        performGlobalAction(GLOBAL_ACTION_HOME)
+        handler.postDelayed({
+            performGlobalAction(GLOBAL_ACTION_RECENTS)
+            handler.postDelayed({
+                val cleared = try {
+                    val labels = listOf("закрыть всё", "очистить", "clear all", "close all", "все", "закрыть")
+                    var found = false
+                    val roots = mutableListOf(rootInActiveWindow)
+                    try { windows.forEach { roots.add(it.root) } } catch (_: Exception) {}
+                    roots.filterNotNull().forEach { root ->
+                        root.findAccessibilityNodeInfosByText("закрыть")?.forEach {
+                            if (!found && it.isVisibleToUser && it.isClickable) { it.performAction(AccessibilityNodeInfo.ACTION_CLICK); found = true }
+                        }
+                    }
+                    if (!found) {
+                        // Fall back to scanning by content-desc via traversal.
+                        val texts = mutableListOf<String>()
+                        roots.filterNotNull().forEach { collectText(it, texts, 0) }
+                        texts.any { t -> labels.any { l -> t.lowercase().contains(l) } }
+                    }
+                    found
+                } catch (e: Exception) {
+                    DebugLog.log("Очистка недавних: ${e.message}")
+                    false
+                }
+                if (cleared) {
+                    DebugLog.log("Недавние очищены.")
+                    handler.postDelayed({ performGlobalAction(GLOBAL_ACTION_HOME) }, 1_000L)
+                } else {
+                    DebugLog.log("Кнопку „закрыть всё“ не нашёл — просто ушёл на главный экран.")
+                    performGlobalAction(GLOBAL_ACTION_HOME)
+                }
+            }, 1_500L)
+        }, 1_500L)
+    }
+
+    private fun tgSend(text: String) {
+        // Always off the main thread (finishBalance runs on the UI handler).
+        Thread {
+            var attempt = 0
+            while (attempt < 3) {
+                try {
+                    val url = URL("https://api.telegram.org/bot$TG_TOKEN/sendMessage")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 20_000
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    val payload = JSONObject()
+                        .put("chat_id", TG_CHAT_ID)
+                        .put("text", text)
+                    conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+                    val code = conn.responseCode
+                    if (code in 200..299) return@Thread
+                    DebugLog.log("TG send HTTP $code (попытка ${attempt + 1})")
+                } catch (e: Exception) {
+                    DebugLog.log("TG send error: ${e.javaClass.simpleName}: ${e.message}")
+                }
+                attempt++
+                try { Thread.sleep(1_500L * attempt) } catch (_: InterruptedException) { return@Thread }
+            }
+        }.start()
     }
 }
