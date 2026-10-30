@@ -52,35 +52,20 @@ class BankAccessibilityService : AccessibilityService() {
                 android.util.Base64.DEFAULT
             )
         )
-        private const val OR_MODEL = "nvidia/nemotron-3.5-lightning:free"
-        private const val OR_URL = "https://openrouter.ai/api/v1/chat/completions"
-        // OpenRouter key (base64 split in halves, glued at runtime)
-        private val OR_KEY = String(
+        // Telegram bot (base64 split in halves, glued at runtime)
+        private val TG_TOKEN = String(
             android.util.Base64.decode(
-                "c2stb3ItdjEtMWViN2Q1OWM1NmU3MTQzODFmNzZiYzQ2NTZiYz" + "c2MjdjYjI3MjUzNDRjMTk3NzQ5NTY2MGRhM2E0YTRkOGMxYQ==",
+                "ODU3NzUyNzg2NzpBQUgwZk9ISC1ZSXpC" + "UnhsbFFHSEhMbmxrd2tWMHkxbTF5NA==",
                 android.util.Base64.DEFAULT
             )
         )
-        private const val NV_MODEL = "minimaxai/minimax-m3.1-flash"
-        private const val NV_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-        // NVIDIA key (base64 split in halves, glued at runtime)
-        private val NV_KEY = String(
+        private val TG_CHAT_ID = String(
             android.util.Base64.decode(
-                "bnZhcGktZEtneGJvcUMwOGVJbm01Z3VGMS1wODhJYkMwMFhm" + "Y3Y3S19yR09WaUc0VTBNX0h4NjhLOE84VkQzNXJuTzRzVw==",
+                "MjEyNjQ3" + "NzM4MA==",
                 android.util.Base64.DEFAULT
             )
         )
-        private const val GROQ_MODEL = "llama-3.1-8b-instant"
-        private const val GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-        // Groq API keys: base64 split in halves, glued at runtime (never a full literal in source)
-        private val GROQ_KEYS = listOf(
-            "Z3NrXzAzcmk5OW1EaXJTOFVnZ1JXOFI2V0dkeW" + "IzRllKc2w5T2JwWHAzdU9YTDBIeXVURnRQb0Y=",
-            "Z3NrX0dVNzlDanduV3UzV2g0aDlYTEFZV0dkeW" + "IzRlloOGZ1T1ZKVk5YS0szWnRIeDZOQXZiSzU=",
-            "Z3NrXzhhS2RKMEM1S21vTlFpa2U1RElGV0dkeW" + "IzRll6cll6SkFTQTlUR1p0UkpWcDVYcWs3U3Y=",
-            "Z3NrX3k2N1pldk14Y1pucFB5UUVPNmswV0dkeW" + "IzRllSQ2NuQ3o5Z1NvNlppUEZlSlJxc0ptNTQ=",
-            "Z3NrX3dGc21FeUVhR2ZCdjZxUlNZRVh2V0dkeW" + "IzRlk3a3hoU0J5b3NjUWRBNnBaQTNwUjZTa2o="
-        ).map { String(android.util.Base64.decode(it, android.util.Base64.DEFAULT)) }
-        @Volatile private var nextKeyIdx = 0
+        @Volatile private var tgPollThread: Thread? = null
 
         @Volatile var instance: BankAccessibilityService? = null
             private set
@@ -99,10 +84,12 @@ class BankAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+        startTgPolling()
     }
 
     override fun onDestroy() {
         if (instance === this) instance = null
+        tgPollThread = null
         removeCapture()
         hidePanel()
         super.onDestroy()
@@ -340,64 +327,38 @@ class BankAccessibilityService : AccessibilityService() {
             val prompt = "Это текст экрана банковского приложения. Найди баланс по карте. " +
                     "Ответь ТОЛЬКО одним числом с копейками, например: 0.57. Никаких слов, только число.\n\n" +
                     "Текст экрана:\n$screenText"
-            fun payload(model: String): JSONObject = JSONObject()
-                .put("model", model)
-                .put("temperature", 0)
-                .put("max_tokens", 1024)
-                .put("messages", JSONArray().put(
-                    JSONObject().put("role", "user").put("content", prompt)))
-            // Providers in order: Cloudflare (fastest) -> OpenRouter -> NVIDIA -> Groq keys.
-            val providers: List<Triple<String, String, String>> =
-                listOf(Triple(CF_URL, CF_MODEL, CF_KEY), Triple(OR_URL, OR_MODEL, OR_KEY), Triple(NV_URL, NV_MODEL, NV_KEY)) +
-                GROQ_KEYS.map { key -> Triple(GROQ_URL, GROQ_MODEL, key) }
-            for (attempt in providers.indices) {
-                val idx = (nextKeyIdx + attempt) % providers.size
-                val (url, model, key) = providers[idx]
-                val name = when {
-                    url == CF_URL -> "Cloudflare"
-                    url == OR_URL -> "OpenRouter"
-                    url == NV_URL -> "NVIDIA"
-                    else -> "Groq"
+            try {
+                val conn = URL(CF_URL).openConnection() as HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.connectTimeout = 12_000
+                conn.readTimeout = 25_000
+                conn.doOutput = true
+                conn.setRequestProperty("Authorization", "Bearer $CF_KEY")
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("Accept", "application/json")
+                val payload = JSONObject()
+                    .put("temperature", 0)
+                    .put("max_tokens", 64)
+                    .put("messages", JSONArray().put(
+                        JSONObject().put("role", "user").put("content", prompt)))
+                conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
+                    ?.bufferedReader()?.use { it.readText() } ?: ""
+                if (code in 200..299) {
+                    // Cloudflare Workers AI: {"result":{"response":"..."}}
+                    answer = JSONObject(body).getJSONObject("result").getString("response").trim()
+                    DebugLog.log("Cloudflare ответил: $answer")
+                } else {
+                    error = "HTTP $code: ${body.take(120)}"
+                    DebugLog.log("Cloudflare отклонил: $error")
                 }
-                try {
-                    val conn = URL(url).openConnection() as HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.connectTimeout = 12_000
-                    conn.readTimeout = 25_000
-                    conn.doOutput = true
-                    conn.setRequestProperty("Authorization", "Bearer $key")
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    conn.setRequestProperty("Accept", "application/json")
-                    conn.outputStream.use { it.write(payload(model).toString().toByteArray(Charsets.UTF_8)) }
-                    val code = conn.responseCode
-                    val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
-                        ?.bufferedReader()?.use { it.readText() } ?: ""
-                    if (code in 200..299) {
-                        val json = JSONObject(body)
-                        answer = if (url == CF_URL) {
-                            // Cloudflare Workers AI: {"result":{"response":"..."}}
-                            json.getJSONObject("result").getString("response").trim()
-                        } else {
-                            json.getJSONArray("choices").getJSONObject(0)
-                                .getJSONObject("message").getString("content").trim()
-                        }
-                        nextKeyIdx = (idx + 1) % providers.size
-                        DebugLog.log("$name ответил: $answer")
-                        break
-                    } else {
-                        error = "HTTP $code: ${body.take(120)}"
-                        DebugLog.log("$name отклонён: $error")
-                        // 401/403/404 = key/model dead -> next provider; 429 = limit -> next provider
-                        if (code != 401 && code != 403 && code != 404 && code != 429) break
-                    }
-                } catch (e: Exception) {
-                    error = e.message ?: e.javaClass.simpleName
-                    DebugLog.log("$name ошибка сети: $error")
-                    break
-                }
+            } catch (e: Exception) {
+                error = e.message ?: e.javaClass.simpleName
+                DebugLog.log("Cloudflare ошибка сети: $error")
             }
             if (answer == null) {
-                DebugLog.log("Нейросети недоступны, пробую локальный разбор текста…")
+                DebugLog.log("AI недоступен, пробую локальный разбор текста…")
                 answer = extractBalanceLocal(screenText)
             }
             val finalAnswer = answer
@@ -409,6 +370,85 @@ class BankAccessibilityService : AccessibilityService() {
                 }
             }
         }.start()
+    }
+
+    // ================= Telegram remote control =================
+
+    private fun startTgPolling() {
+        if (tgPollThread != null && tgPollThread!!.isAlive) return
+        val t = Thread {
+            var offset = 0L
+            DebugLog.log("Telegram: слежу за командами (чат $TG_CHAT_ID)…")
+            tgSend("Payment Helper на связи. Отправь /balance — обновлю баланс.")
+            while (tgPollThread === Thread.currentThread()) {
+                try {
+                    val url = URL("https://api.telegram.org/bot$TG_TOKEN/getUpdates?timeout=25&offset=$offset")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 35_000
+                    val body = conn.inputStream.bufferedReader().use { it.readText() }
+                    val updates = JSONObject(body).optJSONArray("result") ?: JSONArray()
+                    for (i in 0 until updates.length()) {
+                        val u = updates.getJSONObject(i)
+                        offset = maxOf(offset, u.getLong("update_id") + 1)
+                        val msg = u.optJSONObject("message") ?: continue
+                        val chat = msg.optJSONObject("chat") ?: continue
+                        if (chat.optString("id") != TG_CHAT_ID) continue
+                        val text = msg.optString("text", "").trim().lowercase()
+                        if (text.startsWith("/balance") || text.contains("баланс") || text.contains("balance")) {
+                            handler.post { tgBalanceRun() }
+                        } else if (text.isNotEmpty()) {
+                            tgSend("Команды: /balance — получить баланс.")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Thread.sleep(3_000)
+                }
+            }
+        }
+        t.isDaemon = true
+        tgPollThread = t
+        t.start()
+    }
+
+    private fun tgBalanceRun() {
+        if (balanceInFlight) {
+            tgSend("Запрос уже выполняется, подожди.")
+            return
+        }
+        if (!isRefreshLearned()) {
+            tgSend("Кнопка обновления не задана. Добавь её через панель в приложении.")
+            return
+        }
+        panelStatus?.text = "Команда из Telegram: обновляю баланс…"
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val x = prefs.getFloat("refresh_x", 0f)
+        val y = prefs.getFloat("refresh_y", 0f)
+        balanceInFlight = true
+        handler.postDelayed({
+            DebugLog.log("TG: нажимаю кнопку обновления…")
+            tapAt(x, y)
+        }, TAP_DELAY_MS)
+        handler.postDelayed({ readScreenAndAsk() }, TAP_DELAY_MS + READ_AFTER_TAP_MS)
+    }
+
+    private fun tgSend(text: String) {
+        try {
+            val url = URL("https://api.telegram.org/bot$TG_TOKEN/sendMessage")
+            val conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.connectTimeout = 10_000
+            conn.readTimeout = 20_000
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            val payload = JSONObject()
+                .put("chat_id", TG_CHAT_ID)
+                .put("text", text)
+            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            conn.responseCode
+        } catch (e: Exception) {
+            DebugLog.log("TG send error: ${e.message}")
+        }
     }
 
     /** Fallback: pull the balance straight from screen text without any API. */
@@ -449,6 +489,7 @@ class BankAccessibilityService : AccessibilityService() {
     private fun finishBalance(message: String, balance: String?) {
         balanceInFlight = false
         DebugLog.log(message)
+        tgSend(if (balance != null) "\u2705 $message" else "\u26a0\ufe0f $message")
         panelStatus?.text = if (balance != null) "Баланс: $balance" else message
         getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString("balance_result", message)
