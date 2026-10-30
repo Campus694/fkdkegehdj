@@ -433,22 +433,32 @@ class BankAccessibilityService : AccessibilityService() {
     }
 
     private fun tgSend(text: String) {
-        try {
-            val url = URL("https://api.telegram.org/bot$TG_TOKEN/sendMessage")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.connectTimeout = 10_000
-            conn.readTimeout = 20_000
-            conn.doOutput = true
-            conn.setRequestProperty("Content-Type", "application/json")
-            val payload = JSONObject()
-                .put("chat_id", TG_CHAT_ID)
-                .put("text", text)
-            conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            conn.responseCode
-        } catch (e: Exception) {
-            DebugLog.log("TG send error: ${e.message}")
-        }
+        // Always off the main thread (finishBalance runs on the UI handler).
+        Thread {
+            var attempt = 0
+            while (attempt < 3) {
+                try {
+                    val url = URL("https://api.telegram.org/bot$TG_TOKEN/sendMessage")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.connectTimeout = 10_000
+                    conn.readTimeout = 20_000
+                    conn.doOutput = true
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    val payload = JSONObject()
+                        .put("chat_id", TG_CHAT_ID)
+                        .put("text", text)
+                    conn.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+                    val code = conn.responseCode
+                    if (code in 200..299) return@Thread
+                    DebugLog.log("TG send HTTP $code (попытка ${attempt + 1})")
+                } catch (e: Exception) {
+                    DebugLog.log("TG send error: ${e.javaClass.simpleName}: ${e.message}")
+                }
+                attempt++
+                try { Thread.sleep(1_500L * attempt) } catch (_: InterruptedException) { return@Thread }
+            }
+        }.start()
     }
 
     /** Fallback: pull the balance straight from screen text without any API. */
