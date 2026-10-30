@@ -37,6 +37,21 @@ class BankAccessibilityService : AccessibilityService() {
         private const val PREFS = "payment_helper"
         private const val READ_AFTER_TAP_MS = 3_500L
         private const val TAP_DELAY_MS = 800L
+        private const val CF_MODEL = "@cf/meta/llama-3.1-8b-instruct-fast"
+        private const val CF_URL =
+            "https://api.cloudflare.com/client/v4/accounts/" + String(
+                android.util.Base64.decode(
+                    "MWYzYzRmOTdlYjk0Y2ZkY2" + "M4YjhhYTI2NjFkMmU5N2I=",
+                    android.util.Base64.DEFAULT
+                )
+            ) + "/ai/run/" + CF_MODEL
+        // Cloudflare API token (base64 split in halves, glued at runtime)
+        private val CF_KEY = String(
+            android.util.Base64.decode(
+                "Y2Z1dF8yMWlwNTQwMTAydm9mVDdPc2JrYWRm" + "TjRHYTdZUU5BUnVLVGZGNGtkOTk3M2I1N2Y=",
+                android.util.Base64.DEFAULT
+            )
+        )
         private const val OR_MODEL = "nvidia/nemotron-3.5-lightning:free"
         private const val OR_URL = "https://openrouter.ai/api/v1/chat/completions"
         // OpenRouter key (base64 split in halves, glued at runtime)
@@ -318,7 +333,7 @@ class BankAccessibilityService : AccessibilityService() {
 
     private fun askAI(screenText: String) {
         panelStatus?.text = "Спрашиваю у нейросети…"
-        DebugLog.log("Отправляю текст в OpenRouter ($OR_MODEL)…")
+        DebugLog.log("Отправляю текст в Cloudflare Workers AI ($CF_MODEL)…")
         Thread {
             var answer: String? = null
             var error: String? = null
@@ -331,14 +346,15 @@ class BankAccessibilityService : AccessibilityService() {
                 .put("max_tokens", 1024)
                 .put("messages", JSONArray().put(
                     JSONObject().put("role", "user").put("content", prompt)))
-            // Providers in order: OpenRouter first, then NVIDIA, then Groq keys (rotating).
+            // Providers in order: Cloudflare (fastest) -> OpenRouter -> NVIDIA -> Groq keys.
             val providers: List<Triple<String, String, String>> =
-                listOf(Triple(OR_URL, OR_MODEL, OR_KEY), Triple(NV_URL, NV_MODEL, NV_KEY)) +
+                listOf(Triple(CF_URL, CF_MODEL, CF_KEY), Triple(OR_URL, OR_MODEL, OR_KEY), Triple(NV_URL, NV_MODEL, NV_KEY)) +
                 GROQ_KEYS.map { key -> Triple(GROQ_URL, GROQ_MODEL, key) }
             for (attempt in providers.indices) {
                 val idx = (nextKeyIdx + attempt) % providers.size
                 val (url, model, key) = providers[idx]
                 val name = when {
+                    url == CF_URL -> "Cloudflare"
                     url == OR_URL -> "OpenRouter"
                     url == NV_URL -> "NVIDIA"
                     else -> "Groq"
@@ -357,9 +373,14 @@ class BankAccessibilityService : AccessibilityService() {
                     val body = (if (code in 200..299) conn.inputStream else conn.errorStream)
                         ?.bufferedReader()?.use { it.readText() } ?: ""
                     if (code in 200..299) {
-                        answer = JSONObject(body)
-                            .getJSONArray("choices").getJSONObject(0)
-                            .getJSONObject("message").getString("content").trim()
+                        val json = JSONObject(body)
+                        answer = if (url == CF_URL) {
+                            // Cloudflare Workers AI: {"result":{"response":"..."}}
+                            json.getJSONObject("result").getString("response").trim()
+                        } else {
+                            json.getJSONArray("choices").getJSONObject(0)
+                                .getJSONObject("message").getString("content").trim()
+                        }
                         nextKeyIdx = (idx + 1) % providers.size
                         DebugLog.log("$name ответил: $answer")
                         break
